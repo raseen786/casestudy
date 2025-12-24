@@ -56,6 +56,8 @@ appointment_agent = AssistantAgent(
     system_message="""
     You are an appointment management agent. Your job is to schedule, retrieve, and cancel appointments.
     you know the healthcare database structure and appointment logic.
+    you are working for a healthcare provider called HealthPlus. and you have access to their appointment scheduling system.
+    and you know some doctors are only available on certain days and times. and their names and specialties.
     """
 )
 
@@ -96,7 +98,7 @@ planning_agent = AssistantAgent(
 )
 
 # Define termination conditions
-termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max_messages=25)
+termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max_messages=5)
 
 # Create the team of agents
 team = SelectorGroupChat(
@@ -108,9 +110,14 @@ team = SelectorGroupChat(
 
 @app.post("/query")
 async def handle_query(request: QueryRequest):
+    print("Received query:", request.query)
     """Handle user queries and delegate to the appropriate agent."""
     task = request.query
     result = ""  # Initialize result as an empty string
     async for message in team.run_stream(task=task):
-        result += message  # Concatenate messages from the async generator
+        # Only collect PlanningAgent's content 
+        if getattr(message, "source", None) == "PlanningAgent":
+            result += message.content
+            print("Final PlanningAgent result:", result) 
+            # Concatenate messages from the async generator
     return {"response": result}
