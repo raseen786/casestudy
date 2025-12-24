@@ -1,150 +1,116 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
-from sqlalchemy.orm import Session
-from database import get_db, Appointment, Prescription
-from datetime import datetime
-from agents.agent_logic import SymptomCheckerAgent, AppointmentManagerAgent, PrescriptionAgent, EmergencyAgent, PlanningAgent
+from typing import Optional
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.teams import SelectorGroupChat
+from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
+from lab45_autogen_extension.lab45aiplatform_autogen_extension import Lab45AIPlatformCompletionClient
 
+# Initialize FastAPI app
 app = FastAPI()
 
-# Request models
+# Add CORS middleware to allow cross-origin requests
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this to restrict origins in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Define the request model
 class QueryRequest(BaseModel):
     query: str
     user_id: Optional[str] = None
 
-class SymptomRequest(BaseModel):
-    symptoms: List[str]
-    duration: str
-    severity: int  # 1-10
+class CustomCLient(Lab45AIPlatformCompletionClient):
+    def close(self):
+        # Custom processing of tool output can be implemented here
+        pass
 
-class AppointmentRequest(BaseModel):
-    doctor_name: str
-    specialty: str
-    preferred_date: str
-    user_id: str
+# Initialize the model client
+model_client = CustomCLient(
+    model="gpt-4o",
+    base_url="https://api.waip.wiprocms.com/v1.1/",
+    api_key="token|f5abf501-82b4-459b-86a0-8757826c9f7c|57d2d0a3754fc8bc17526d561d328185b0dc891b22c8b96f67702bc433451afc",
+    enable_state_storage=True
+)
 
-class PrescriptionRequest(BaseModel):
-    medication_name: str
-    user_id: Optional[str] = None
+# Define specialized agents
+symptom_agent = AssistantAgent(
+    "SymptomAgent",
+    description="Analyzes symptoms and provides advice.",
+    model_client=model_client,
+    system_message="""
+    You are a symptom analysis agent. Your job is to analyze symptoms provided by the user and give recommendations.
+    """
+)
 
-class EmergencyRequest(BaseModel):
-    emergency_type: str
-    description: str
+appointment_agent = AssistantAgent(
+    "AppointmentAgent",
+    description="Manages appointment scheduling.",
+    model_client=model_client,
+    system_message="""
+    You are an appointment management agent. Your job is to schedule, retrieve, and cancel appointments.
+    you know the healthcare database structure and appointment logic.
+    """
+)
 
-# Root endpoint
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Healthcare Chatbot API!"}
+prescription_agent = AssistantAgent(
+    "PrescriptionAgent",
+    description="Provides prescription information.",
+    model_client=model_client,
+    system_message="""
+    You are a prescription information agent. Your job is to provide details about medications.
+    """
+)
 
-# Query endpoint
+emergency_agent = AssistantAgent(
+    "EmergencyAgent",
+    description="Guides users during emergencies.",
+    model_client=model_client,
+    system_message="""
+    You are an emergency guidance agent. Your job is to provide step-by-step instructions during emergencies.
+    """
+)
+
+response_formatter_agent = AssistantAgent(
+    "ResponseFormatterAgent",
+    description="Formats responses for user queries.",
+    model_client=model_client,
+    system_message="""
+    You are a response formatting agent. Your job is to ensure responses are clear and user-friendly.
+    """
+)
+
+planning_agent = AssistantAgent(
+    "PlanningAgent",
+    description="Coordinates which agent should handle each query.",
+    model_client=model_client,
+    system_message="""
+    You are a planning agent. Your job is to determine which specialized agent should handle the user query and when satisfied end with 'TERMINATE' key.
+    """
+)
+
+# Define termination conditions
+termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max_messages=25)
+
+# Create the team of agents
+team = SelectorGroupChat(
+    [planning_agent, symptom_agent, appointment_agent, prescription_agent, emergency_agent, response_formatter_agent],
+    model_client=model_client,
+    termination_condition=termination,
+    allow_repeated_speaker=True
+)
+
 @app.post("/query")
-def handle_query(request: QueryRequest):
-    """Handle general user queries and route to appropriate agent."""
-    agent_name = PlanningAgent.route_query(request.query)
-
-    if agent_name == "SymptomCheckerAgent":
-        return SymptomCheckerAgent.analyze_symptoms([], "", 0)  # Placeholder
-    elif agent_name == "AppointmentManagerAgent":
-        return AppointmentManagerAgent.get_appointments(request.user_id)
-    elif agent_name == "PrescriptionAgent":
-        return PrescriptionAgent.get_prescription_info("Placeholder")
-    elif agent_name == "EmergencyAgent":
-        return EmergencyAgent.provide_guidance("", "")  # Placeholder
-    else:
-        return {"error": "Unknown query type"}
-
-# Symptom Checker endpoint
-@app.post("/symptom-check")
-def symptom_check(request: SymptomRequest):
-    """Analyze symptoms and provide preliminary advice."""
-    return {
-        "symptoms": request.symptoms,
-        "duration": request.duration,
-        "severity": request.severity,
-        "advice": "Please consult a healthcare professional for a proper diagnosis.",
-        "recommendations": ["Rest", "Stay hydrated", "Monitor symptoms"]
-    }
-
-# Appointment Scheduling endpoint
-@app.post("/appointments")
-def schedule_appointment(request: AppointmentRequest, db: Session = Depends(get_db)):
-    """Book an appointment with a healthcare provider."""
-    appointment_date = datetime.strptime(request.preferred_date, "%Y-%m-%d")
-    appointment = Appointment(
-        user_id=request.user_id,
-        doctor_name=request.doctor_name,
-        specialty=request.specialty,
-        date=appointment_date,
-        status="Scheduled"
-    )
-    db.add(appointment)
-    db.commit()
-    db.refresh(appointment)
-    return {
-        "appointment_id": appointment.id,
-        "doctor_name": appointment.doctor_name,
-        "specialty": appointment.specialty,
-        "preferred_date": appointment.date,
-        "status": appointment.status
-    }
-
-# Get appointments endpoint
-@app.get("/appointments/{user_id}")
-def get_appointments(user_id: str, db: Session = Depends(get_db)):
-    """Retrieve user's scheduled appointments."""
-    appointments = db.query(Appointment).filter(Appointment.user_id == user_id).all()
-    return {
-        "user_id": user_id,
-        "appointments": [
-            {
-                "appointment_id": appt.id,
-                "doctor_name": appt.doctor_name,
-                "date": appt.date,
-                "status": appt.status
-            } for appt in appointments
-        ]
-    }
-
-# Cancel appointment endpoint
-@app.delete("/appointments/{appointment_id}")
-def cancel_appointment(appointment_id: str, db: Session = Depends(get_db)):
-    """Cancel a scheduled appointment."""
-    appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
-    if appointment:
-        db.delete(appointment)
-        db.commit()
-        return {
-            "appointment_id": appointment_id,
-            "status": "Appointment cancelled successfully"
-        }
-    return {"error": "Appointment not found"}
-
-# Prescription Inquiry endpoint
-@app.post("/prescriptions")
-def prescription_inquiry(request: PrescriptionRequest, db: Session = Depends(get_db)):
-    """Get information about medications."""
-    prescription = db.query(Prescription).filter(Prescription.medication_name == request.medication_name).first()
-    if prescription:
-        return {
-            "medication_name": prescription.medication_name,
-            "dosage": prescription.dosage,
-            "frequency": prescription.frequency,
-            "side_effects": prescription.side_effects.split(","),
-            "warnings": prescription.warnings
-        }
-    return {"error": "Prescription not found"}
-
-# Emergency Guidance endpoint
-@app.post("/emergency")
-def emergency_guidance(request: EmergencyRequest):
-    """Provide step-by-step guidance for emergency situations."""
-    return {
-        "emergency_type": request.emergency_type,
-        "steps": [
-            "Step 1: Call emergency services immediately (911)",
-            "Step 2: Keep the person calm and comfortable",
-            "Step 3: Follow dispatcher instructions"
-        ],
-        "follow_up": "Seek immediate medical attention"
-    }
+async def handle_query(request: QueryRequest):
+    """Handle user queries and delegate to the appropriate agent."""
+    task = request.query
+    result = ""  # Initialize result as an empty string
+    async for message in team.run_stream(task=task):
+        result += message  # Concatenate messages from the async generator
+    return {"response": result}
